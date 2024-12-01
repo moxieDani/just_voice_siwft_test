@@ -5,139 +5,245 @@
 //  Created by Kisoon Kwon on 11/28/24.
 //
 
-import SwiftUI
+import Foundation
 import AVFoundation
+import SwiftUI
+
+class AudioPlayer: ObservableObject {
+    var justVoiceHandle: UnsafeMutablePointer<just_voice_handle_t?>? = nil
+    var audioEngine: AVAudioEngine!
+    var playerNode: AVAudioPlayerNode!
+    var audioFile: AVAudioFile!
+    var audioBuffer: AVAudioPCMBuffer!
+    var currentSampleIndex = 0
+    var isPlaying = false
+    let blockSize = 512
+    
+    @Published var noiseReductionIntensity: Float = 0.5
+    
+    init() {
+        loadAudioFile()
+        setupJustVoiceAPI()
+        setupAudioEngine()
+    }
+    
+    func setupJustVoiceAPI() {
+        var config = just_voice_config_t()
+        config.numInputChannels = 1
+        config.numOutputChannels = 1
+        config.sampleRate = UInt32(Float(audioFile.processingFormat.sampleRate)) // Use content's sample rate
+        config.samplesPerBlock = UInt32(blockSize)
+        
+        var params = just_voice_params_t()
+        params.noiseReductionIntensity = 0.5  // Default value
+        
+        // Create Just Voice handle
+        let createResult = JV_CREATE(&justVoiceHandle)
+        if createResult != JV_SUCCESS {
+            print("Error creating Just Voice handle.")
+            return
+        }
+        
+        let setupResult = JV_SETUP(justVoiceHandle, &config, &params)
+        if setupResult != JV_SUCCESS {
+            print("Error setting up Just Voice.")
+            return
+        }
+    }
+
+    func setupAudioEngine() {
+        audioEngine = AVAudioEngine()
+        playerNode = AVAudioPlayerNode()
+        let timePitch = AVAudioUnitTimePitch()
+        timePitch.rate = 1.0 // Set playback speed to 1x (can adjust later if needed)
+
+        audioEngine.attach(playerNode)
+        audioEngine.attach(timePitch)
+        
+        // Dynamically set the number of channels and sample rate based on the loaded audio file
+        let channelCount = audioFile.processingFormat.channelCount
+        let sampleRate = audioFile.processingFormat.sampleRate
+        let outputFormat = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: UInt32(channelCount))!
+        
+        // Connect playerNode -> timePitch -> mainMixerNode
+        audioEngine.connect(playerNode, to: timePitch, format: outputFormat)
+        audioEngine.connect(timePitch, to: audioEngine.mainMixerNode, format: outputFormat)
+        
+        do {
+            try audioEngine.start()
+        } catch {
+            print("Error starting audio engine: \(error)")
+        }
+    }
+
+    func loadAudioFile() {
+        guard let url = Bundle.main.url(forResource: "sunrise-serenade-203778", withExtension: "wav") else {
+            print("Audio file not found.")
+            return
+        }
+        
+        do {
+            audioFile = try AVAudioFile(forReading: url)
+            let frameCount = AVAudioFrameCount(audioFile.length)
+            audioBuffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: frameCount)!
+            try audioFile.read(into: audioBuffer)
+            print("Loaded audio file.")
+        } catch {
+            print("Error loading audio file: \(error)")
+        }
+    }
+
+    func playPCMDataBlock() {
+        if currentSampleIndex >= audioBuffer.frameLength {
+            print("Reached end of audio data.")
+            stopPlayback()
+            return
+        }
+        
+        let startSample = currentSampleIndex
+        let endSample = min(currentSampleIndex + blockSize, Int(audioBuffer.frameLength))
+        
+        _ = AVAudioFrameCount(endSample - startSample)
+        
+        // Create a buffer slice for the block
+        let blockBuffer = audioBuffer.slice(from: startSample, to: endSample)
+
+        // Get the first channel's data from the blockBuffer
+        guard let inputData = blockBuffer.floatChannelData?[0] else {
+            print("Error: No channel data found in the buffer.")
+            return
+        }
+
+        // Prepare an output buffer for the processed audio
+        var outputData = Array(repeating: Float(0), count: blockSize)
+        
+        // Process the audio using Just Voice API
+        let processResult = JV_PROCESS(justVoiceHandle, inputData, &outputData, UInt32(blockSize))
+        if processResult != JV_SUCCESS {
+            print("Error processing audio block(%d).", processResult)
+        }
+
+        // Create an AVAudioPCMBuffer from the processed output data
+        let outputBuffer = AVAudioPCMBuffer(pcmFormat: blockBuffer.format, frameCapacity: AVAudioFrameCount(outputData.count))!
+        outputBuffer.frameLength = AVAudioFrameCount(outputData.count)
+        for channel in 0..<outputBuffer.format.channelCount {
+            let outputChannelData = outputBuffer.floatChannelData![Int(channel)]
+            for i in 0..<outputData.count {
+                outputChannelData[i] = outputData[i]
+            }
+        }
+
+        // Schedule the buffer for playback
+        playerNode.scheduleBuffer(outputBuffer) {
+            DispatchQueue.main.async {
+                self.currentSampleIndex = endSample
+                if self.isPlaying {
+                    self.playPCMDataBlock() // Recursively call for the next block
+                }
+            }
+        }
+
+        // If player is not already playing, start it
+        if !playerNode.isPlaying {
+            playerNode.play()
+        }
+    }
+    
+    func updateNoiseReductionIntensity() {
+        var params = just_voice_params_t()
+        params.noiseReductionIntensity = noiseReductionIntensity
+        
+        let updateResult = JV_UPDATE(justVoiceHandle, &params)
+        if updateResult != JV_SUCCESS {
+            print("Error updating noise reduction intensity.")
+        }
+    }
+
+    func startPlayback() {
+        if !isPlaying {
+            isPlaying = true
+            playPCMDataBlock()
+        }
+    }
+
+    func stopPlayback() {
+        if isPlaying {
+            playerNode.stop()
+            isPlaying = false
+            currentSampleIndex = 0
+            print("Playback stopped.")
+        }
+    }
+}
+
+extension AVAudioPCMBuffer {
+    func slice(from start: Int, to end: Int) -> AVAudioPCMBuffer {
+        let frameCount = AVAudioFrameCount(end - start)
+        let buffer = AVAudioPCMBuffer(pcmFormat: self.format, frameCapacity: frameCount)!
+        buffer.frameLength = frameCount
+
+        // Copy data for all channels
+        for channel in 0..<self.format.channelCount {
+            let sourceChannelData = self.floatChannelData![Int(channel)]
+            let destinationChannelData = buffer.floatChannelData![Int(channel)]
+            for i in start..<end {
+                destinationChannelData[i - start] = sourceChannelData[i]
+            }
+        }
+        
+        return buffer
+    }
+}
 
 struct ContentView: View {
-    @State private var justVoiceHandle: UnsafeMutablePointer<just_voice_handle_t?>? = nil
-    @State private var noiseReductionIntensity: Float = 0.9
-    @State private var isProcessed: Bool = false
-    @State private var audioPlayer: AVAudioPlayer?
-    @State private var outputFileURL: URL? // 저장된 WAV 파일 경로
-    let wavProcessor = WAVProcessor() // WAV 처리 클래스 인스턴스 생성
+    @StateObject private var audioPlayer = AudioPlayer()
 
     var body: some View {
         VStack {
-            Text("Just Voice iOS App")
+            Text("Audio Processor with Noise Reduction")
+                            .font(.largeTitle)
+                            .padding()
+
+                        Slider(value: $audioPlayer.noiseReductionIntensity, in: 0...1, step: 0.01)
+                            .padding()
+                            .onChange(of: audioPlayer.noiseReductionIntensity) {
+                                audioPlayer.updateNoiseReductionIntensity()
+                            }
+
+                        Text("Noise Reduction Intensity: \(audioPlayer.noiseReductionIntensity, specifier: "%.2f")")
+                            .padding()
+
+            Text("Audio Player")
                 .font(.largeTitle)
                 .padding()
-
-            // 노이즈 제거 강도 슬라이더
+            
             HStack {
-                Text("Noise Reduction: \(String(format: "%.2f", noiseReductionIntensity))")
-                Slider(value: Binding(
-                    get: { Double(noiseReductionIntensity) },
-                    set: { newValue in
-                        noiseReductionIntensity = Float(newValue)
-                        updateNoiseReduction()
-                    }
-                ), in: 0.0...1.0)
-                    .padding()
-            }
-
-            // 오디오 처리 버튼
-            Button("Process Audio") {
-                processAudio()
-            }
-            .padding()
-
-            // 오디오 재생 버튼
-            Button("Play Processed Audio") {
-                playSavedAudio()
-            }
-            .padding()
-            .disabled(!isProcessed) // 처리 완료 여부에 따라 활성화
-        }
-        .onAppear {
-            initializeJustVoice()
-        }
-        .onDisappear {
-            destroyJustVoice()
-        }
-    }
-
-    // Just Voice 초기화
-    func initializeJustVoice() {
-        let result = JV_CREATE(&justVoiceHandle)
-        guard result == JV_SUCCESS else {
-            print("Failed to initialize Just Voice")
-            return
-        }
-
-        var config = just_voice_config_t(numInputChannels: 2, numOutputChannels: 2, sampleRate: 44100, samplesPerBlock: 0)
-        var params = just_voice_params_t(noiseReductionIntensity: noiseReductionIntensity)
-        let setupResult = JV_SETUP(justVoiceHandle, &config, &params)
-        guard setupResult == JV_SUCCESS else {
-            print("Failed to set up Just Voice")
-            return
-        }
-    }
-
-    // Just Voice 리소스 해제
-    func destroyJustVoice() {
-        JV_DESTROY(&justVoiceHandle)
-    }
-
-    // 슬라이더 값 변경 시 호출
-    func updateNoiseReduction() {
-        guard let handle = justVoiceHandle else { return }
-        var params = just_voice_params_t(noiseReductionIntensity: noiseReductionIntensity)
-        let result = JV_UPDATE(handle, &params)
-        if result != JV_SUCCESS {
-            print("Failed to update noise reduction intensity")
-        }
-    }
-
-    // 오디오 처리
-        func processAudio() {
-            guard let handle = justVoiceHandle else { return }
-
-            // 번들에서 오디오 파일 로드
-            guard let path = Bundle.main.path(forResource: "sunrise-serenade-203778", ofType: "wav") else {
-                print("Audio file not found in bundle.")
-                return
-            }
-
-            let url = URL(fileURLWithPath: path)
-
-            do {
-                // WAV 파일 데이터를 로드
-                let wavData = try Data(contentsOf: url)
-
-                // PCM 데이터로 변환
-                var pcmBuffer = wavProcessor.convertToPCM(data: wavData)
-
-                // Just Voice API를 사용하여 오디오 처리
-                var outputBuffer = [Float](repeating: 0.0, count: pcmBuffer.count)
-                let processResult = JV_PROCESS(handle, &pcmBuffer, &outputBuffer, UInt32(pcmBuffer.count))
-
-                if processResult == JV_SUCCESS {
-                    print("Audio processed successfully.")
-
-                    // 처리된 데이터를 WAV 파일로 저장
-                    outputFileURL = wavProcessor.saveAsWAV(buffer: outputBuffer)
-                    isProcessed = outputFileURL != nil
-                } else {
-                    print("Audio processing failed with error code: \(processResult)")
+                Button(action: {
+                    audioPlayer.startPlayback()
+                }) {
+                    Text("Play")
+                        .font(.title)
+                        .padding()
+                        .background(Color.green)
+                        .foregroundColor(.white)
+                        .cornerRadius(10)
                 }
-            } catch {
-                print("Failed to process audio: \(error)")
+                
+                Button(action: {
+                    audioPlayer.stopPlayback()
+                }) {
+                    Text("Stop")
+                        .font(.title)
+                        .padding()
+                        .background(Color.red)
+                        .foregroundColor(.white)
+                        .cornerRadius(10)
+                }
             }
+            .padding()
+            
+            Spacer()
         }
-
-    // 처리된 WAV 파일 재생
-    func playSavedAudio() {
-        guard let fileURL = outputFileURL else {
-            print("Processed audio file not found.")
-            return
-        }
-
-        do {
-            audioPlayer = try AVAudioPlayer(contentsOf: fileURL)
-            audioPlayer?.play()
-            print("Playing processed audio.")
-        } catch {
-            print("Failed to play audio: \(error)")
-        }
+        .padding()
     }
 }
